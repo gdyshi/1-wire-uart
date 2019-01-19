@@ -31,19 +31,18 @@
 #include <linux/hrtimer.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 
-#define DEVNAME		 	"1-wire-uart"
+#define DEVNAME		 	"1-wire"
 
-#define GPIO_TO_PIN(bank, gpio)     (32 * (bank) + (gpio))
-#define UART_GPIO             GPIO_TO_PIN(0, 6)
+#define UART_GPIO             22
 
-#define Debug(fmt, arg...)          printk("%s.%d ", __FILE__, __LINE__);\
-                                    printk("(%s %s):", __DATE__, __TIME__);\
-					                printk(fmt, ##arg);\
+#define Debug(fmt, arg...)          printk(fmt, ##arg);\
 					                printk("\n")
 
+#define DEF_BAUD              (4800)
 #define US_TO_NS(var)               (var * 1000)
-
+#define BAUD_TO_NS(_baud_)          (1000000000/_baud_)
 #define LED_DRV_MAGICNUM            'z'
 #define LED_IOCTL_CMD_GET(cmd)      (_IOC_NR(cmd))
 #define LED_IOCTL_CMD_IS_VALID(cmd) ((_IOC_TYPE(cmd) == LED_DRV_MAGICNUM) ? 1 : 0)
@@ -57,8 +56,14 @@ typedef struct _uart_elem
 {
     unsigned char direction;
     unsigned char value;
-    unsigned short delay_time_us;// hz
+    unsigned short delay_time_ns;// hz
 }uart_elem_t;
+typedef enum{
+       idle=0,
+	recv,
+	send
+}status_e;
+status_e status;
 
 struct _uart_dev
 {
@@ -67,17 +72,18 @@ struct _uart_dev
     struct class *uart_class;
     dev_t uart_dev_number;
     int gpio;
+
+    unsigned long delay_time_ns;
+    status_e status;
+
+    unsigned char send_char;
+    unsigned char recv_char;
     
-    unsigned short delay_time_us;
-    
-    uart_elem_t * arg;//æ‰§è¡Œåºåˆ—
-    unsigned short arg_len;//æ‰§è¡Œåºåˆ—é•¿åº¦
-    unsigned short arg_idx;//å½“å‰æ‰§è¡Œçš„ä¸‹æ ‡
-	struct completion	complete_request;
+    struct completion	complete_request;
     spinlock_t lock;
 }*uart_dev;
 
-//é˜²æ­¢è¢«å¤šç”¨æˆ·åŒæ—¶æ‰“å¼€
+//·ÀÖ¹±»¶àÓÃ»§Í¬Ê±´ò¿ª
 static atomic_t dev_is_open = ATOMIC_INIT(1);
 static int set_gpio_in(int gpio)
 {
@@ -100,62 +106,92 @@ static int get_gpio_val(int gpio)
     return gpio_get_value(gpio);
 }
 
-static int process_next_elem(struct _uart_dev *dev)
-{
-    unsigned long _ns = 0;
-    unsigned long hz = 0;
-    uart_elem_t * elem = NULL;
-    ktime_t ntime;
-
-    if(dev->arg_len <= dev->arg_idx)
-    {
-        Debug("process_next_elem: out of len.%d----%d",dev->arg_len,dev->arg_idx);
-        goto out;
-    }
-    elem = &dev->arg[dev->arg_idx++];
-    if(elem->direction)
-    {
-        set_gpio_val(dev->gpio, elem->value);
-    }
-    else
-    {
-        elem->value=get_gpio_val(dev->gpio);
-    }
-
-    _ns = US_TO_NS(hz);
-
-    Debug("timer:%ld ns",_ns);
-    ntime = ktime_set(0, _ns);
-    hrtimer_start(&dev->timer, ntime, HRTIMER_MODE_REL);
-    return 0;
-
-out:
-    if (!completion_done(&(dev->complete_request)))
-    {
-        printk("complete 1\n");
-        complete(&(dev->complete_request));
-    }
-    return -1;
-
-}
-
 /********************************************************************************************/
-/*	å‡½æ•°åç§°ï¼š	static enum hrtimer_restart elem_timeout(struct hrtimer *t)				*/
-/*	å…¥å£å‚æ•°ï¼š	struct hrtimer *t		hrtimer è¶…æ—¶ä¸­æ–­é»˜è®¤å‚æ•°							*/
-/*	è¿”å›å€¼ï¼š	enum hrtimer_restart    hrtimer è¶…æ—¶ä¸­æ–­å¤„ç†å®Œæˆç»“æœ						*/
-/*	å‡½æ•°åŠŸèƒ½ï¼š	hrtimer è¶…æ—¶ä¸­æ–­å“åº”å‡½æ•°ã€‚å¤„ç†gpio çš„çŠ¶æ€ç¿»è½¬ï¼Œäº§ç”ŸPWMæ–¹æ³¢					*/
+/*	º¯ÊıÃû³Æ£º	static enum hrtimer_restart elem_timeout(struct hrtimer *t)				*/
+/*	Èë¿Ú²ÎÊı£º	struct hrtimer *t		hrtimer ³¬Ê±ÖĞ¶ÏÄ¬ÈÏ²ÎÊı							*/
+/*	·µ»ØÖµ£º	enum hrtimer_restart    hrtimer ³¬Ê±ÖĞ¶Ï´¦ÀíÍê³É½á¹û						*/
+/*	º¯Êı¹¦ÄÜ£º	hrtimer ³¬Ê±ÖĞ¶ÏÏìÓ¦º¯Êı¡£´¦Àígpio µÄ×´Ì¬·­×ª£¬²úÉúPWM·½²¨					*/
 /********************************************************************************************/
 static enum hrtimer_restart elem_timeout(struct hrtimer *t)
 {
     /*struct timespec uptime;  	*/
-    //ktime_t ntime;
+    ktime_t ntime;
     struct _uart_dev *dev = uart_dev;
-
+    int in_val=0;
+    static int recving=0;
+    static int recv_bitnum=0;
+    static int recv_bits=0;
+    static int sending=0;
+    static int send_bitnum=0;
+    static int send_bits=0;
     Debug("elem_timeout\n");
-    process_next_elem(dev);
+    Debug("timer:%ld ns",dev->delay_time_ns);
+    ntime = ktime_set(0, dev->delay_time_ns);
+    hrtimer_start(&dev->timer, ntime, HRTIMER_MODE_REL);
+
+
+    switch(dev->status)
+    {
+    	case recv:
+    		in_val=get_gpio_val(dev->gpio);
+    		if(recving)//ÒÑ¾­½ÓÊÕµ½ÆğÊ¼Î»
+    		{
+    			if(--recv_bitnum==0)
+    			{
+    				dev->recv_char=recv_bits;	//save the data to RBUF
+    				recving=0;		//stop receive
+                            spin_lock(dev->lock);
+                            dev->status=idle;
+                            spin_unlock(dev->lock);
+                            printk("complete\n");
+                            complete(&(dev->complete_request));
+    			}else
+    			{
+                            printk("got bit %d\n",in_val);
+    				recv_bits >>=1;
+    				if(in_val)	recv_bits|=0x80;//shift RX data to RX buffer
+    			}
+    		}else if(0==in_val)//½ÓÊÕµ½ÆğÊ¼Î»
+    		{
+                     printk("got start\n");
+    			recving=1;
+    			recv_bitnum=9;
+    		}
+    		break;
+    	case send:
+    		if(send_bitnum==0)
+    		{
+                     printk("put start\n");
+    			set_gpio_val(dev->gpio,0);//send start bit
+    			send_bits=dev->send_char;//load data from buf to send_bits
+    			send_bitnum=9;//inital send bit number(8 data bits + 1 stop bit)
+    		}else
+    		{
+    			if(--send_bitnum==0)
+    			{
+    				set_gpio_val(dev->gpio,1);//stop send
+                            spin_lock(dev->lock);
+                            dev->status=idle;
+                            spin_unlock(dev->lock);
+                            printk("complete\n");
+                            complete(&(dev->complete_request));
+
+    			}else
+    			{
+                            printk("put bit %d\n",send_bits&0x01);
+    				set_gpio_val(dev->gpio,send_bits&0x01);
+    				send_bits >>=1;
+    			}
+    		}
+    		break;
+    }
+
+
+
+
+
+
     
-    //ntime = ktime_set(0, uart_dev->arg[uart_dev->arg_idx++].delay_time_us);
-    //hrtimer_start(&uart_dev->timer, ntime, HRTIMER_MODE_REL);
     return HRTIMER_NORESTART;
 }
 
@@ -164,34 +200,24 @@ static ssize_t uart_write (struct file *filp, const char __user *buf, size_t siz
     struct _uart_dev *dev = filp->private_data;
     uart_elem_t * uart_array = dev->arg;
     unsigned short array_len = 0;
-    unsigned char bytee = *(unsigned char *)buf;
     int i=0;
     printk("uart_write size: %d\n", size);
+    
+    if(recv==dev->status) 
+    {
+        printk("uart_write err: bus busy\n");
+        return -EFAULT;
+    }
 
-    //if(1 != size){
-    //    return 0;
-    //}
     set_gpio_out(dev->gpio);
 
     printk("uart_write: 0x%x\n", bytee);
-
-    i=0;
-    uart_array[i].delay_time_us=dev->delay_time_us;
-    uart_array[i].direction=1;
-    uart_array[i].value=0;
-    for(i=1;i<9;i++)
-    {
-        uart_array[i].delay_time_us=dev->delay_time_us;
-        uart_array[i].direction=1;
-        uart_array[i].value=(bytee & (1<< (i-1)))?1:0;
-    }
-    array_len = 9;
-
-    dev->arg = uart_array;
-    dev->arg_len = array_len;
-    dev->arg_idx = 0;    
-    process_next_elem(dev);
     
+    spin_lock(dev->lock);
+    dev->status=send;
+    dev->send_char=*(unsigned char *)buf;
+    spin_unlock(dev->lock);
+
     wait_for_completion(&(dev->complete_request));
 
     return 1;
@@ -205,46 +231,23 @@ ssize_t uart_read (struct file *filp, char *buff, size_t size, loff_t *offp)
     int i=0;
     int delay_count=0;
     ssize_t result = 0;
-    //if(1 != size){
-    //    return 0;
-    //}
+
+    if(send==dev->status) 
+    {
+        printk("uart_read err: bus busy\n");
+        return -EFAULT;
+    }
+
     set_gpio_in(dev->gpio);
+    spin_lock(dev->lock);
+    dev->status=recv;
+    dev->recv_char=0;
+    spin_unlock(dev->lock);
 
-    
-    uart_array[i].delay_time_us=dev->delay_time_us;
-    uart_array[i].direction=0;
-    uart_array[i].value=0;
-    for(i=1;i<9;i++)
-    {
-        uart_array[i].delay_time_us=dev->delay_time_us;
-        uart_array[i].direction=0;
-        uart_array[i].value=0;
-    }
-    array_len = 9;
-
-    dev->arg = uart_array;
-    dev->arg_len = array_len;
-    dev->arg_idx = 0;    
-    // ç­‰å¾…èµ·å§‹ä½
-    printk("wait\n");
-    while(get_gpio_val(dev->gpio))
-    {
-        delay_count++;
-        udelay(1000);
-        if(1000 < delay_count) break;
-    }
-    printk("wait:%d\n",delay_count);
-    process_next_elem(dev);
-    
     wait_for_completion(&(dev->complete_request));
-    bytee=0;
-    for(i=1;i<9;i++)
-    {
-        bytee |= (uart_array[i].value)?(1<< (i-1)):0;
-    }
-    printk("uart_read: 0x%x\n", bytee);
-    
-    if (copy_to_user (buff, &bytee, 1))
+    printk("uart_read: 0x%x\n", dev->recv_char);
+
+    if (copy_to_user (buff,dev->recv_char, 1))
     {
         result = -EFAULT;
     }
@@ -256,31 +259,35 @@ ssize_t uart_read (struct file *filp, char *buff, size_t size, loff_t *offp)
 }
 
 /********************************************************************************************/
-/*	å‡½æ•°åç§°ï¼š	int uart_open(struct inode *inode, struct file *filp)						*/
-/*	å…¥å£å‚æ•°ï¼š	struct inode *inode, ç”¨æˆ·ç©ºé—´ä¼ é€’çš„è®¾å¤‡èŠ‚ç‚¹ 								*/
-/*				struct file *filp	  æ–‡ä»¶æè¿°ç¬¦											*/
-/*	è¿”å›å€¼ï¼š	int  0 æˆåŠŸï¼Œ<0 å¤±è´¥														*/
-/*	å‡½æ•°åŠŸèƒ½ï¼š	è®¾å¤‡èŠ‚ç‚¹çš„æ ‡å‡†æ‰“å¼€å‡½æ•°														*/
+/*	º¯ÊıÃû³Æ£º	int uart_open(struct inode *inode, struct file *filp)						*/
+/*	Èë¿Ú²ÎÊı£º	struct inode *inode, ÓÃ»§¿Õ¼ä´«µİµÄÉè±¸½Úµã 								*/
+/*				struct file *filp	  ÎÄ¼şÃèÊö·û											*/
+/*	·µ»ØÖµ£º	int  0 ³É¹¦£¬<0 Ê§°Ü														*/
+/*	º¯Êı¹¦ÄÜ£º	Éè±¸½ÚµãµÄ±ê×¼´ò¿ªº¯Êı														*/
 /********************************************************************************************/
 int uart_open(struct inode *inode, struct file *filp)
 {
     struct _uart_dev *dev = NULL;
-    
+    set_gpio_out(uart_dev->gpio);
+
     if(!atomic_dec_and_test(&dev_is_open))
     {
         atomic_inc(&dev_is_open);
         Debug("Bus busy \n");
         return -EBUSY;//already open
     }
+    spin_lock(dev->lock);
+    dev->status=idle;
+    spin_unlock(dev->lock);
 
-    //å°†ç§æœ‰æ•°æ®å…³è”åˆ° private_data
+    //½«Ë½ÓĞÊı¾İ¹ØÁªµ½ private_data
     dev = container_of(inode->i_cdev, struct _uart_dev, cdev);
     if(!dev)
     {
         Debug("get private data error!\n");
         return -EFAULT;
     }
-
+    init_completion(&(uart_dev->complete_request));
 
     filp->private_data = dev;
     Debug("uart: OK devices ok \n");
@@ -288,24 +295,28 @@ int uart_open(struct inode *inode, struct file *filp)
 }
 
 /********************************************************************************************/
-/*	å‡½æ•°åç§°ï¼š static int uart_release(struct indoe *ndoe, struct file *file)				*/
-/*	å…¥å£å‚æ•°ï¼š struct indoe *ndoe	  è®¾å¤‡èŠ‚ç‚¹												*/
-/*			   struct file *file	  æ–‡ä»¶æè¿°ç¬¦											*/
-/*	è¿”å›å€¼ï¼š	int  0 æˆåŠŸï¼Œ<0 å¤±è´¥														*/
-/*	å‡½æ•°åŠŸèƒ½ï¼š	è®¾å¤‡å…³é—­å‡½æ•°																*/
+/*	º¯ÊıÃû³Æ£º static int uart_release(struct indoe *ndoe, struct file *file)				*/
+/*	Èë¿Ú²ÎÊı£º struct indoe *ndoe	  Éè±¸½Úµã												*/
+/*			   struct file *file	  ÎÄ¼şÃèÊö·û											*/
+/*	·µ»ØÖµ£º	int  0 ³É¹¦£¬<0 Ê§°Ü														*/
+/*	º¯Êı¹¦ÄÜ£º	Éè±¸¹Ø±Õº¯Êı																*/
 /********************************************************************************************/
 static int uart_release(struct inode *indoe, struct file *file)
 {
+    set_gpio_out(uart_dev->gpio);
     Debug("close \n");
-    if (!completion_done(&(uart_dev->complete_request)))
+    //if (!completion_done(&(uart_dev->complete_request)))
     {
-        Debug("complete 2\n");
-        complete(&(uart_dev->complete_request));
+        //Debug("complete 2\n");
+        complete_all(&(uart_dev->complete_request));
     }
+    spin_lock(dev->lock);
+    dev->status=idle;
+    spin_unlock(dev->lock);
 
-    //é‡Šæ”¾è¢«æ‰“å¼€çš„æ–‡ä»¶
+    //ÊÍ·Å±»´ò¿ªµÄÎÄ¼ş
     atomic_inc(&dev_is_open);
-    //é”€æ¯è®¾å¤‡
+    //Ïú»ÙÉè±¸
     Debug("close done \n");
 
     return 0;
@@ -322,14 +333,15 @@ struct file_operations uart_fops =
 };
 
 /********************************************************************************************/
-/*	å‡½æ•°åç§°ï¼š static int __init uart_init(void)												*/
-/*	å…¥å£å‚æ•°ï¼š æ— 																			*/
-/*	è¿”å›å€¼ï¼š	int  0 æ ‡è¯†æˆåŠŸï¼Œ<0 è®¾å¤‡å¤±è´¥												*/
-/*	å‡½æ•°åŠŸèƒ½ï¼š	é©±åŠ¨åˆå§‹åŒ–å…¥å£å‡½æ•°ï¼Œæ³¨å†Œè®¾å¤‡èŠ‚ç‚¹											*/
+/*	º¯ÊıÃû³Æ£º static int __init uart_init(void)												*/
+/*	Èë¿Ú²ÎÊı£º ÎŞ																			*/
+/*	·µ»ØÖµ£º	int  0 ±êÊ¶³É¹¦£¬<0 Éè±¸Ê§°Ü												*/
+/*	º¯Êı¹¦ÄÜ£º	Çı¶¯³õÊ¼»¯Èë¿Úº¯Êı£¬×¢²áÉè±¸½Úµã											*/
 /********************************************************************************************/
 static int __init uart_init(void)
 {
     int result = -1;
+    ktime_t ntime;
 
     Debug("uart_init get in\n");
 
@@ -341,13 +353,7 @@ static int __init uart_init(void)
         goto err_dev;
     }
     Debug("uart_init malloc memory ok\n");
-    uart_dev->arg = kzalloc(13*sizeof(uart_elem_t), GFP_KERNEL);
-    if(!uart_dev->arg)
-    {
-        Debug("uart_init: malloc memory error");
-        goto err_arg;
-    }
-
+    uart_dev->delay_time_ns=BAUD_TO_NS(DEF_BAUD);
     if(alloc_chrdev_region(&uart_dev->uart_dev_number, 0, 1, DEVNAME))
     {
         Debug("Cant't register devices \n");
@@ -361,33 +367,37 @@ static int __init uart_init(void)
     result = cdev_add(&uart_dev->cdev, uart_dev->uart_dev_number, 1);
     if(result)
     {
-        if(!uart_dev)
-            kfree(uart_dev);
-
-        Debug(KERN_NOTICE "Error adding LED");
+        Debug(KERN_NOTICE "Error adding cdev");
         goto err_add;
     }
 
-    uart_dev->uart_class = class_create(THIS_MODULE, "1-wire-uart_class");
+    uart_dev->uart_class = class_create(THIS_MODULE, "1-wire_class");
     device_create(uart_dev->uart_class, NULL, MKDEV(MAJOR(uart_dev->uart_dev_number),
                   0), "LED",DEVNAME);
     Debug("uart_init create device ok\n");
 
     uart_dev->gpio = UART_GPIO;
-    gpio_request(uart_dev->gpio,"uart");
+    result = gpio_request(uart_dev->gpio,"uart");
+    if(result)
+    {
+        printk("Error request gpio");
+        //goto err_add;
+    }
+    set_gpio_out(uart_dev->gpio);
+
     spin_lock_init(&uart_dev->lock);
     hrtimer_init(&uart_dev->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     uart_dev->timer.function = elem_timeout;
     Debug("uart_init set uart polarity ok!\n");
-    
+    ntime = ktime_set(0, uart_dev->delay_time_ns);
+    hrtimer_start(&uart_dev->timer, ntime, HRTIMER_MODE_REL);
+
     init_completion(&(uart_dev->complete_request));
     return 0;
 
 err_add:
     unregister_chrdev_region(uart_dev->uart_dev_number, 1);
 err_region:
-    if(!uart_dev->arg)
-        kfree(uart_dev->arg);
 err_arg:
     if(!uart_dev)
         kfree(uart_dev);
@@ -396,10 +406,10 @@ err_dev:
 }
 
 /********************************************************************************************/
-/*	å‡½æ•°åç§°ï¼š static void __exit uart_exit(void)											*/
-/*	å…¥å£å‚æ•°ï¼š æ— 																			*/
-/*	è¿”å›å€¼ï¼š   æ— 																			*/
-/*	å‡½æ•°åŠŸèƒ½ï¼š	é©±åŠ¨å¸è½½å‡½æ•°																*/
+/*	º¯ÊıÃû³Æ£º static void __exit uart_exit(void)											*/
+/*	Èë¿Ú²ÎÊı£º ÎŞ																			*/
+/*	·µ»ØÖµ£º   ÎŞ																			*/
+/*	º¯Êı¹¦ÄÜ£º	Çı¶¯Ğ¶ÔØº¯Êı																*/
 /********************************************************************************************/
 static void __exit uart_exit(void)
 {
@@ -415,15 +425,13 @@ static void __exit uart_exit(void)
     //cancel_work_sync(&uart_dev->work);
     unregister_chrdev_region(uart_dev->uart_dev_number, 1);
 
-    //ï¿½ï¿½ï¿½ï¿½ï¿½è±¸
+    //?????õô
     device_destroy(uart_dev->uart_class, uart_dev->uart_dev_number);
     cdev_del(&uart_dev->cdev);
 
     class_destroy(uart_dev->uart_class);
     if(!uart_dev)
     {
-        if(!uart_dev->arg)
-            kfree(uart_dev->arg);
         kfree(uart_dev);
     }
 
@@ -434,6 +442,5 @@ module_init(uart_init);
 module_exit(uart_exit);
 
 MODULE_AUTHOR("gdyshi <gdyshi@126.com>");
-MODULE_DESCRIPTION("1-wire-uart driver");
+MODULE_DESCRIPTION("1-wire driver");
 MODULE_LICENSE("GPL");
-
