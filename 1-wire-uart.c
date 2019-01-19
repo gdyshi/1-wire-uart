@@ -96,7 +96,7 @@ static int set_gpio_out(int gpio)
 static int set_gpio_val(int gpio,int val)
 {
     gpio_set_value(gpio, val);
-    printk("set_gpio_val : %d\n",val);
+    //printk("set_gpio_val : %d\n",val);
     return 0;
 }
 static int get_gpio_val(int gpio)
@@ -105,7 +105,7 @@ static int get_gpio_val(int gpio)
     //return 1;
     return gpio_get_value(gpio);
 }
-
+int repeat=0;
 /********************************************************************************************/
 /*	函数名称：	static enum hrtimer_restart elem_timeout(struct hrtimer *t)				*/
 /*	入口参数：	struct hrtimer *t		hrtimer 超时中断默认参数							*/
@@ -124,10 +124,13 @@ static enum hrtimer_restart elem_timeout(struct hrtimer *t)
     static int sending=0;
     static int send_bitnum=0;
     static int send_bits=0;
-    Debug("elem_timeout\n");
-    Debug("timer:%ld ns",dev->delay_time_ns);
-    ntime = ktime_set(0, dev->delay_time_ns);
-    hrtimer_start(&dev->timer, ntime, HRTIMER_MODE_REL);
+    //Debug("elem_timeout\n");
+    //Debug("timer:%ld ns",dev->delay_time_ns);
+    if(repeat)
+    {
+        ntime = ktime_set(0, dev->delay_time_ns);
+        hrtimer_start(&dev->timer, ntime, HRTIMER_MODE_REL);
+    }
 
 
     switch(dev->status)
@@ -138,22 +141,30 @@ static enum hrtimer_restart elem_timeout(struct hrtimer *t)
     		{
     			if(--recv_bitnum==0)
     			{
-    				dev->recv_char=recv_bits;	//save the data to RBUF
-    				recving=0;		//stop receive
-                            spin_lock(dev->lock);
-                            dev->status=idle;
-                            spin_unlock(dev->lock);
-                            printk("complete\n");
-                            complete(&(dev->complete_request));
+    			       if(1==in_val)// 收到停止位
+    			        {
+        				dev->recv_char=recv_bits;	//save the data to RBUF
+        				recving=0;		//stop receive
+                                    spin_lock(&dev->lock);
+                                    dev->status=idle;
+                                    spin_unlock(&dev->lock);
+                                    printk("complete\n");
+                                    complete(&(dev->complete_request));
+    			        }else// 收到错误停止位
+        		            {
+                                    printk("error stop\n");
+
+        		            recving=0;
+        		            }
     			}else
     			{
-                            printk("got bit %d\n",in_val);
+                            //printk("got bit %d\n",in_val);
     				recv_bits >>=1;
     				if(in_val)	recv_bits|=0x80;//shift RX data to RX buffer
     			}
     		}else if(0==in_val)//接收到起始位
     		{
-                     printk("got start\n");
+                     //printk("got start\n");
     			recving=1;
     			recv_bitnum=9;
     		}
@@ -161,7 +172,7 @@ static enum hrtimer_restart elem_timeout(struct hrtimer *t)
     	case send:
     		if(send_bitnum==0)
     		{
-                     printk("put start\n");
+                     //printk("put start\n");
     			set_gpio_val(dev->gpio,0);//send start bit
     			send_bits=dev->send_char;//load data from buf to send_bits
     			send_bitnum=9;//inital send bit number(8 data bits + 1 stop bit)
@@ -170,37 +181,27 @@ static enum hrtimer_restart elem_timeout(struct hrtimer *t)
     			if(--send_bitnum==0)
     			{
     				set_gpio_val(dev->gpio,1);//stop send
-                            spin_lock(dev->lock);
+                            spin_lock(&dev->lock);
                             dev->status=idle;
-                            spin_unlock(dev->lock);
+                            spin_unlock(&dev->lock);
                             printk("complete\n");
                             complete(&(dev->complete_request));
 
     			}else
     			{
-                            printk("put bit %d\n",send_bits&0x01);
+                            //printk("put bit %d\n",send_bits&0x01);
     				set_gpio_val(dev->gpio,send_bits&0x01);
     				send_bits >>=1;
     			}
     		}
     		break;
     }
-
-
-
-
-
-
-    
     return HRTIMER_NORESTART;
 }
 
 static ssize_t uart_write (struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
 {
     struct _uart_dev *dev = filp->private_data;
-    uart_elem_t * uart_array = dev->arg;
-    unsigned short array_len = 0;
-    int i=0;
     printk("uart_write size: %d\n", size);
     
     if(recv==dev->status) 
@@ -211,13 +212,13 @@ static ssize_t uart_write (struct file *filp, const char __user *buf, size_t siz
 
     set_gpio_out(dev->gpio);
 
-    printk("uart_write: 0x%x\n", bytee);
     
-    spin_lock(dev->lock);
+    spin_lock(&dev->lock);
     dev->status=send;
     dev->send_char=*(unsigned char *)buf;
-    spin_unlock(dev->lock);
-
+    spin_unlock(&dev->lock);
+    
+    printk("uart_write: 0x%x\n", dev->send_char);
     wait_for_completion(&(dev->complete_request));
 
     return 1;
@@ -225,11 +226,6 @@ static ssize_t uart_write (struct file *filp, const char __user *buf, size_t siz
 ssize_t uart_read (struct file *filp, char *buff, size_t size, loff_t *offp)
 {
     struct _uart_dev *dev = filp->private_data;
-    uart_elem_t * uart_array = dev->arg;
-    unsigned short array_len = 0;
-    unsigned char bytee = *(unsigned char *)buff;
-    int i=0;
-    int delay_count=0;
     ssize_t result = 0;
 
     if(send==dev->status) 
@@ -239,15 +235,16 @@ ssize_t uart_read (struct file *filp, char *buff, size_t size, loff_t *offp)
     }
 
     set_gpio_in(dev->gpio);
-    spin_lock(dev->lock);
+    spin_lock(&dev->lock);
     dev->status=recv;
     dev->recv_char=0;
-    spin_unlock(dev->lock);
+    spin_unlock(&dev->lock);
 
-    wait_for_completion(&(dev->complete_request));
+    result=wait_for_completion_timeout(&(dev->complete_request),20*HZ);
+    if(0 == result) return 0;
     printk("uart_read: 0x%x\n", dev->recv_char);
 
-    if (copy_to_user (buff,dev->recv_char, 1))
+    if (copy_to_user (buff,&dev->recv_char, 1))
     {
         result = -EFAULT;
     }
@@ -276,9 +273,6 @@ int uart_open(struct inode *inode, struct file *filp)
         Debug("Bus busy \n");
         return -EBUSY;//already open
     }
-    spin_lock(dev->lock);
-    dev->status=idle;
-    spin_unlock(dev->lock);
 
     //将私有数据关联到 private_data
     dev = container_of(inode->i_cdev, struct _uart_dev, cdev);
@@ -287,6 +281,9 @@ int uart_open(struct inode *inode, struct file *filp)
         Debug("get private data error!\n");
         return -EFAULT;
     }
+    spin_lock(&dev->lock);
+    dev->status=idle;
+    spin_unlock(&dev->lock);
     init_completion(&(uart_dev->complete_request));
 
     filp->private_data = dev;
@@ -310,9 +307,9 @@ static int uart_release(struct inode *indoe, struct file *file)
         //Debug("complete 2\n");
         complete_all(&(uart_dev->complete_request));
     }
-    spin_lock(dev->lock);
-    dev->status=idle;
-    spin_unlock(dev->lock);
+    spin_lock(&uart_dev->lock);
+    uart_dev->status=idle;
+    spin_unlock(&uart_dev->lock);
 
     //释放被打开的文件
     atomic_inc(&dev_is_open);
@@ -390,6 +387,7 @@ static int __init uart_init(void)
     uart_dev->timer.function = elem_timeout;
     Debug("uart_init set uart polarity ok!\n");
     ntime = ktime_set(0, uart_dev->delay_time_ns);
+    repeat=1;
     hrtimer_start(&uart_dev->timer, ntime, HRTIMER_MODE_REL);
 
     init_completion(&(uart_dev->complete_request));
@@ -413,10 +411,11 @@ err_dev:
 /********************************************************************************************/
 static void __exit uart_exit(void)
 {
+    repeat=0;
     Debug("uart_exit get in\n\n\n");
-
     if(uart_dev)
     {
+        udelay(100000);
         hrtimer_cancel(&uart_dev->timer);
         //cancel_work_sync(&uart_dev->work);
         Debug("hrtime and work cancel done !\n");
